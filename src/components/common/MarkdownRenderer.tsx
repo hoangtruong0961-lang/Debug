@@ -3,6 +3,7 @@ import React, { useMemo, useState, useEffect } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
+import { Terminal, Code, RotateCcw, Wrench } from 'lucide-react';
 import { RegexScript } from '../../types';
 import { getRegexedString } from '../../utils/regex';
 import { dbService } from '../../services/db/indexedDB';
@@ -532,16 +533,201 @@ ${code}
   },
 };
 
+/**
+ * Kỹ thuật B: Sửa lỗi tự động chuỗi ký tự xuống dòng trái phép trong JavaScript (literal newline)
+ * Tự động tìm chuỗi dùng nháy đơn (') hoặc nháy kép (") kéo dài nhiều dòng mà không được escape,
+ * sau đó chuyển đổi chúng thành Template Literal (dấu backticks `) và escape các ký tự nội suy nếu cần.
+ */
+function repairLiteralNewlines(code: string): string {
+  let inSingleComment = false;
+  let inMultiComment = false;
+  let inString: '"' | "'" | null = null;
+  let inTemplate = false;
+  let stringStartIdx = -1;
+  let hasNewline = false;
+  
+  const replacements: { start: number; end: number }[] = [];
+
+  for (let i = 0; i < code.length; i++) {
+    const char = code[i];
+    const nextChar = code[i + 1] || '';
+
+    if (inSingleComment) {
+      if (char === '\n' || char === '\r') {
+        inSingleComment = false;
+      }
+      continue;
+    }
+
+    if (inMultiComment) {
+      if (char === '*' && nextChar === '/') {
+        inMultiComment = false;
+        i++;
+      }
+      continue;
+    }
+
+    if (inString !== null) {
+      if (char === '\\') {
+        i++;
+        continue;
+      }
+      if (char === '\n' || char === '\r') {
+        hasNewline = true;
+        continue;
+      }
+      if (char === inString) {
+        if (hasNewline) {
+          replacements.push({ start: stringStartIdx, end: i });
+        }
+        inString = null;
+      }
+      continue;
+    }
+
+    if (inTemplate) {
+      if (char === '\\') {
+        i++;
+        continue;
+      }
+      if (char === '`') {
+        inTemplate = false;
+      }
+      continue;
+    }
+
+    if (char === '/' && nextChar === '/') {
+      inSingleComment = true;
+      i++;
+      continue;
+    }
+    if (char === '/' && nextChar === '*') {
+      inMultiComment = true;
+      i++;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      inString = char;
+      stringStartIdx = i;
+      hasNewline = false;
+      continue;
+    }
+    if (char === '`') {
+      inTemplate = true;
+      continue;
+    }
+  }
+
+  if (replacements.length === 0) return code;
+
+  let repaired = code;
+  for (let j = replacements.length - 1; j >= 0; j--) {
+    const { start, end } = replacements[j];
+    let stringContent = repaired.slice(start + 1, end);
+    stringContent = stringContent.replace(/\$\{/g, '\\${');
+    
+    repaired = 
+      repaired.slice(0, start) + 
+      '`' + 
+      stringContent + 
+      '`' + 
+      repaired.slice(end + 1);
+  }
+
+  return repaired;
+}
+
+/**
+ * Trích xuất các khối mã HTML/XML/JS/Humble Script từ câu trả lời gỡ lỗi của AI trợ lý
+ */
+function extractHtmlCodeBlocks(text: string): string[] {
+  const blocks: string[] = [];
+  const regex = /```(?:html|xml|javascript|js)?\s*([\s\S]*?)```/gi;
+  let match;
+  while ((match = regex.exec(text)) !== null) {
+    if (match[1] && match[1].trim()) {
+      blocks.push(match[1].trim());
+    }
+  }
+  return blocks;
+}
+
 const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
   const [showSource, setShowSource] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
-  const [logs, setLogs] = useState<{type: string, message: string, time: string}[]>([]);
+  const [logs, setLogs] = useState<{type: string, message: string, time: string, lineno?: number}[]>([]);
+  const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
+  const [sourceTab, setSourceTab] = useState<'raw' | 'compiled' | 'ai'>('raw');
+  const [aiChat, setAiChat] = useState<{role: 'user' | 'model', text: string}[]>([]);
+  const [aiInput, setAiInput] = useState('');
+  const [isAiLoading, setIsAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+
+  const storageKey = useMemo(() => {
+    if (!contentAttr) return '';
+    let hash = 0;
+    for (let i = 0; i < contentAttr.length; i++) {
+      const char = contentAttr.charCodeAt(i);
+      hash = (hash << 5) - hash + char;
+      hash = hash & hash;
+    }
+    return `sandbox_widget_code_${Math.abs(hash)}`;
+  }, [contentAttr]);
+
+  const [editedCode, setEditedCode] = useState<string | null>(() => {
+    if (!contentAttr) return null;
+    let hash = 0;
+    for (let i = 0; i < contentAttr.length; i++) {
+       const char = contentAttr.charCodeAt(i);
+       hash = (hash << 5) - hash + char;
+       hash = hash & hash;
+    }
+    const key = `sandbox_widget_code_${Math.abs(hash)}`;
+    try {
+      return localStorage.getItem(key);
+    } catch (e) {
+      console.error("Lỗi đọc code đã lưu:", e);
+      return null;
+    }
+  });
+
+  const [isEditingManually, setIsEditingManually] = useState(false);
+
+  useEffect(() => {
+    if (storageKey) {
+      if (editedCode !== null) {
+        try {
+          localStorage.setItem(storageKey, editedCode);
+        } catch (e) {
+          console.error("Lỗi lưu code sandbox:", e);
+        }
+      } else {
+        try {
+          localStorage.removeItem(storageKey);
+        } catch (e) {
+          console.error("Lỗi xóa code sandbox:", e);
+        }
+      }
+    }
+  }, [editedCode, storageKey]);
+
   const iframeRef = React.useRef<HTMLIFrameElement>(null);
   const widgetId = useMemo(() => Math.random().toString(36).substring(2, 9), []);
 
   useEffect(() => {
     console.log(`[IframeSandboxWidget] Initializing widget ${widgetId} with content length: ${contentAttr?.length}`);
   }, [widgetId, contentAttr?.length]);
+
+  const scrollToErrorLine = () => {
+    if (highlightedLine) {
+      setTimeout(() => {
+        const el = document.getElementById(`compiled-line-${highlightedLine}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 50);
+    }
+  };
 
   useEffect(() => {
     const handleMessage = (e: MessageEvent) => {
@@ -553,10 +739,20 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
         }
         if (e.data.type === 'TAWA_WIDGET_LOG') {
            setLogs(prev => {
-               const newLogs = [...prev, { type: e.data.level, message: e.data.message, time: new Date().toLocaleTimeString() }];
+               const newLogs = [...prev, { 
+                 type: e.data.level, 
+                 message: e.data.message, 
+                 time: new Date().toLocaleTimeString(),
+                 lineno: e.data.lineno 
+               }];
                if (newLogs.length > 50) return newLogs.slice(newLogs.length - 50);
                return newLogs;
            });
+           
+           if (e.data.level === 'error' && e.data.lineno) {
+             setHighlightedLine(e.data.lineno);
+             setSourceTab('compiled');
+           }
         }
       }
     };
@@ -564,15 +760,44 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
     return () => window.removeEventListener('message', handleMessage);
   }, [widgetId]);
 
-  if (!contentAttr) return null;
+  if (!contentAttr && editedCode === null) return null;
   let decoded = '';
   try {
-    if (typeof atob !== 'undefined') {
-      decoded = decodeURIComponent(escape(atob(contentAttr)));
+    if (editedCode !== null) {
+      decoded = editedCode;
     } else {
-      decoded = Buffer.from(contentAttr, 'base64').toString('utf-8');
+      if (typeof atob !== 'undefined') {
+        decoded = decodeURIComponent(escape(atob(contentAttr)));
+      } else {
+        decoded = Buffer.from(contentAttr, 'base64').toString('utf-8');
+      }
     }
     
+    // Fix: Escape any </script in content before rendering to prevent early browser tag closing SyntaxErrors
+    decoded = decoded.replace(/(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi, 
+      (_m, open, code, close) => open + code.replace(/<\/script/gi, '<\\\\/script') + close
+    );
+
+    // Fix: Transform const/let/class inside script tags into global-scoped var variables 
+    // This allows them to bind to the window global object inside raw HTML widget preview sandboxes
+    // so inline handlers like onclick="toggleTalent()" can find them.
+    decoded = decoded.replace(/(<script\b[^>]*>)([\s\S]*?)(<\/script>)/gi, (_m, open, code, close) => {
+      let temp = code;
+      
+      // Khắc phục kỹ thuật tự động sửa lỗi xuống dòng trái phép trong chuỗi (literal newline)
+      temp = repairLiteralNewlines(temp);
+
+      // Replace const/let with var (excluding identifiers starting with const/let)
+      temp = temp.replace(/(?:^|[^a-zA-Z0-9_$])\b(const|let)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g, (match, type) => {
+        return match.replace(new RegExp(`\\b${type}\\b`), 'var');
+      });
+      // Replace class declaration with var name = class name
+      temp = temp.replace(/(?:^|[^a-zA-Z0-9_$])\bclass\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/g, (match, name) => {
+        return match.replace(`class ${name}`, `var ${name} = class ${name}`);
+      });
+      return open + temp + close;
+    });
+
     // Fix 1: Vấn đề gốc rễ - Babel sandbox không thể hoạt động do không có allow-same-origin.
     // Loại bỏ type="text/babel" và data-presets="..." để cho phép trình duyệt dịch native ES6.
     decoded = decoded.replace(/<script\b([^>]*)\btype\s*=\s*["']text\/babel["']([^>]*)>/gi, '<script$1$2>');
@@ -586,7 +811,7 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
   // Cầu nối API (postMessage) cho Iframe Sandbox
   const safeWidgetId = JSON.stringify(widgetId);
   const bridgeScript = `
-    <script>
+    <script id="tawa-bridge">
       (function() {
         var _widgetId = ${safeWidgetId};
         window.TawaAPI = {
@@ -615,6 +840,12 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
                 }
                 return String(a);
             }).join(' ');
+            
+            // Filter out benign Vite WebSocket/HMR noise
+            if (msg.indexOf('WebSocket') !== -1 || msg.indexOf('websocket') !== -1 || msg.indexOf('vite') !== -1 || msg.indexOf('[vite]') !== -1) {
+                return;
+            }
+            
             window.parent.postMessage({ type: 'TAWA_WIDGET_LOG', id: _widgetId, level: level, message: msg }, '*');
         }
         console.log = function() { sendLog('log', arguments); _log.apply(console, arguments); };
@@ -623,24 +854,27 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
         console.info = function() { sendLog('info', arguments); _info.apply(console, arguments); };
         
         window.addEventListener('error', function(event) {
-            sendLog('error', [event.message, 'at', event.filename + ':' + event.lineno]);
+            var msg = event.message || '';
+            if (msg.indexOf('WebSocket') !== -1 || msg.indexOf('websocket') !== -1 || msg.indexOf('vite') !== -1) {
+                return;
+            }
+            window.parent.postMessage({ 
+                type: 'TAWA_WIDGET_LOG', 
+                id: _widgetId, 
+                level: 'error', 
+                message: event.message + ' (at line ' + event.lineno + ')',
+                lineno: event.lineno
+            }, '*');
         });
         window.addEventListener('unhandledrejection', function(event) {
+            var reasonStr = '';
+            if (event.reason) {
+                reasonStr = event.reason.message || String(event.reason);
+            }
+            if (reasonStr.indexOf('WebSocket') !== -1 || reasonStr.indexOf('websocket') !== -1 || reasonStr.indexOf('vite') !== -1) {
+                return;
+            }
             sendLog('error', ['Unhandled Promise Rejection:', event.reason]);
-        });
-        
-        // Fix 2: Force browser to compile inline handlers on page load naturally so they retain declarative global scopes (let/const/class)
-        window.addEventListener('load', function() {
-          var attrs = ['onclick', 'onchange', 'oninput', 'onmouseover', 'onmouseout', 'onkeydown', 'onkeyup', 'onsubmit'];
-          document.querySelectorAll('*').forEach(function(el) {
-            attrs.forEach(function(attr) {
-              var h = el.getAttribute(attr);
-              if (h) {
-                el.removeAttribute(attr);
-                el.setAttribute(attr, h); // Dynamic native recompile by browser
-              }
-            });
-          });
         });
       })();
     </script>
@@ -689,32 +923,379 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
     `;
   }
 
+  const askAiAssistant = async (customPrompt?: string | null, freshStarted = false) => {
+    setIsAiLoading(true);
+    setAiError(null);
+    const userMsgText = customPrompt !== undefined ? customPrompt : aiInput;
+    if (userMsgText === '' && customPrompt === undefined) {
+      setIsAiLoading(false);
+      return;
+    }
+
+    if (customPrompt === undefined) {
+      setAiInput('');
+    }
+
+    const nextChatHistory = [...aiChat];
+    if (userMsgText) {
+      nextChatHistory.push({ role: 'user', text: userMsgText });
+      setAiChat(nextChatHistory);
+    }
+
+    try {
+      const response = await fetch('/api/ai/debug', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          rawCode: decoded,
+          compiledCode: fullDoc,
+          logs: logs,
+          prompt: userMsgText || "Hãy phân tích tình trạng hiện tại của widget và đưa ra lời chào, đề xuất sửa lỗi nếu có.",
+          chatHistory: freshStarted ? [] : aiChat
+        })
+      });
+
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || data.details || 'Không thể gửi yêu cầu gỡ lỗi.');
+      }
+
+      setAiChat(prev => [...prev, { role: 'model', text: data.text }]);
+    } catch (err: any) {
+      setAiError(err.message || 'Lỗi không xác định khi kết nối với máy chủ AI.');
+    } finally {
+      setIsAiLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (sourceTab === 'ai' && aiChat.length === 0 && !isAiLoading) {
+      askAiAssistant("Chào bạn, tôi vừa mở Trợ lý AI Gỡ lỗi. Hãy phân tích toàn diện mã nguồn này và các log/lỗi hiện hữu, đưa ra phân tích gỡ lỗi chi tiết kèm giải thích và mã nguồn đã sửa nếu có lỗi nhé.", true);
+    }
+  }, [sourceTab, aiChat.length]);
+
   return (
     <div className="my-6 relative border-2 border-stone-300 dark:border-slate-600 rounded-xl overflow-hidden bg-white dark:bg-stone-900 shadow-md">
-      <div className="absolute top-0 left-0 right-0 h-6 bg-stone-200 dark:bg-slate-700 flex items-center px-3 gap-1.5 border-b border-stone-300 dark:border-slate-600 z-10">
-        <div className="w-2.5 h-2.5 rounded-full bg-red-400"></div>
-        <div className="w-2.5 h-2.5 rounded-full bg-amber-400"></div>
-        <div className="w-2.5 h-2.5 rounded-full bg-green-400"></div>
-        <span className="text-[10px] font-mono font-bold text-stone-500 dark:text-stone-400 ml-2 tracking-wider">SANDBOX GIAO DIỆN</span>
+      <div className="absolute top-0 left-0 right-0 h-6 bg-stone-200 dark:bg-slate-700 flex items-center px-3 gap-2 border-b border-stone-300 dark:border-slate-600 z-10 select-none">
+        <div className="w-2 h-2 rounded-full bg-red-400"></div>
+        <div className="w-2 h-2 rounded-full bg-amber-400"></div>
+        <div className="w-2 h-2 rounded-full bg-green-400"></div>
+        <span className="text-[9px] font-mono font-bold text-stone-500 dark:text-stone-400 ml-1 tracking-wider uppercase">SANDBOX</span>
+        {editedCode !== null && (
+          <span 
+            className="flex items-center text-amber-600 dark:text-amber-400 ml-1.5"
+            title="Mã nguồn sandbox đã bị chỉnh sửa/gỡ lỗi và tự động lưu"
+          >
+            <Wrench size={10} className="animate-pulse" />
+          </span>
+        )}
+        {editedCode !== null && (
+          <button 
+            type="button"
+            onClick={() => {
+              setEditedCode(null);
+              setIsEditingManually(false);
+              setLogs([]);
+              setHighlightedLine(null);
+            }}
+            className="p-1 text-red-500 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-500/10 rounded transition-colors cursor-pointer"
+            title="Khôi phục mã nguồn gốc ban đầu"
+          >
+            <RotateCcw size={10} />
+          </button>
+        )}
         <button 
           onClick={() => setShowLogs(!showLogs)}
-          className={`ml-auto text-[10px] font-mono font-bold ${showLogs ? 'bg-indigo-500 text-white' : 'text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 bg-white/50 dark:bg-black/20'} uppercase tracking-wider px-2 py-0.5 rounded transition-colors`}
+          className={`ml-auto p-1 rounded transition-all cursor-pointer ${showLogs ? 'bg-indigo-500 text-white' : 'text-stone-500 hover:text-stone-800 dark:text-stone-400 dark:hover:text-stone-200 hover:bg-stone-300/55 dark:hover:bg-slate-600/55'}`}
+          title={showLogs ? 'Đóng nhận ký lỗi (Console Log)' : 'Xem nhật ký lỗi (Console Log)'}
         >
-          {showLogs ? 'Đóng Log' : 'Console Log'}
+          <Terminal size={10} />
         </button>
         <button 
           onClick={() => setShowSource(!showSource)}
-          className={`ml-1 text-[10px] font-mono font-bold ${showSource ? 'bg-indigo-500 text-white' : 'text-indigo-500 hover:text-indigo-600 dark:text-indigo-400 dark:hover:text-indigo-300 bg-white/50 dark:bg-black/20'} uppercase tracking-wider px-2 py-0.5 rounded transition-colors`}
+          className={`p-1 rounded transition-all cursor-pointer ${showSource ? 'bg-indigo-500 text-white' : 'text-stone-500 hover:text-stone-800 dark:text-stone-400 dark:hover:text-stone-200 hover:bg-stone-300/55 dark:hover:bg-slate-600/55'}`}
+          title={showSource ? 'Đóng bảng mã nguồn' : 'Xem/Sửa mã nguồn'}
         >
-          {showSource ? 'Đóng mã nguồn' : 'Xem mã nguồn'}
+          <Code size={10} />
         </button>
       </div>
       
       {showSource ? (
-        <div className="mt-6 mb-0 p-4 bg-stone-900 overflow-auto max-h-[500px]">
-          <pre className="text-xs text-stone-300 font-mono whitespace-pre-wrap break-all">
-            {decoded}
-          </pre>
+        <div className="mt-6 mb-0 border-t border-stone-300 dark:border-slate-600 bg-stone-950 flex flex-col">
+          <div className="bg-stone-900 px-3 py-1.5 flex flex-wrap items-center gap-2 border-b border-stone-800 text-xs shadow-sm">
+            <span className="text-stone-400 font-medium">Chế độ xem:</span>
+            <button 
+              onClick={() => {
+                setSourceTab('raw');
+                setHighlightedLine(null);
+              }} 
+              className={`px-2 py-0.5 rounded font-mono text-[10px] transition-colors ${sourceTab === 'raw' ? 'bg-indigo-600 text-white font-bold' : 'text-stone-400 hover:text-white bg-stone-800'}`}
+            >
+              MÃ GỐC (RAW WIDGET)
+            </button>
+            <button 
+              onClick={() => {
+                setSourceTab('compiled');
+              }} 
+              className={`px-2 py-0.5 rounded font-mono text-[10px] transition-colors ${sourceTab === 'compiled' ? 'bg-indigo-600 text-white font-bold' : 'text-stone-400 hover:text-white bg-stone-800'}`}
+            >
+              HTML ĐẦY ĐỦ (COMPILED IFRAME)
+            </button>
+            <button 
+              onClick={() => {
+                setSourceTab('ai');
+              }} 
+              className={`px-2 py-0.5 rounded font-mono text-[10px] transition-all flex items-center gap-1.5 ${sourceTab === 'ai' ? 'bg-emerald-600 text-white font-bold shadow-sm shadow-emerald-500/20' : 'text-stone-400 hover:text-white bg-stone-800'}`}
+            >
+              <span className={`inline-block w-1.5 h-1.5 rounded-full ${isAiLoading ? 'bg-amber-400 animate-ping' : 'bg-emerald-400'}`}></span>
+              TRỢ LÝ AI (AI DEBUGGER)
+            </button>
+            {sourceTab === 'raw' && (
+              <button 
+                type="button"
+                onClick={() => setIsEditingManually(!isEditingManually)}
+                className={`md:ml-auto px-2 py-0.5 rounded font-mono text-[10px] transition-all flex items-center gap-1 cursor-pointer ${isEditingManually ? 'bg-amber-600 text-white font-bold' : 'text-stone-400 hover:text-white bg-stone-800'}`}
+              >
+                ✏️ {isEditingManually ? 'HOÀN TẤT CHỈNH SỬA' : 'TỰ SỬA MÃ (MANUAL EDIT)'}
+              </button>
+            )}
+            {highlightedLine && sourceTab === 'compiled' && (
+              <div className="md:ml-auto flex items-center gap-2">
+                <span className="text-red-400 font-mono text-[10px] flex items-center gap-1 animate-pulse">
+                  <span>●</span> Lỗi tại dòng {highlightedLine}
+                </span>
+                <button 
+                  onClick={scrollToErrorLine}
+                  className="bg-red-800 hover:bg-red-700 text-white font-mono text-[9px] px-1.5 py-0.5 rounded transition-all uppercase tracking-wider"
+                >
+                  Cuộn đến dòng lỗi
+                </button>
+              </div>
+            )}
+          </div>
+          
+          <div className="p-4 overflow-auto max-h-[500px] font-mono text-xs text-stone-300 leading-relaxed scrollbar-thin">
+            {sourceTab === 'ai' ? (
+              <div className="flex flex-col h-full min-h-[400px] text-stone-200" style={{ fontFamily: 'system-ui, -apple-system, sans-serif' }}>
+                <div className="flex items-center gap-2 mb-3 bg-stone-900/80 p-3 rounded-lg border border-stone-800">
+                  <div className="p-1 px-2 rounded bg-emerald-500/10 text-emerald-400 font-bold font-mono text-[10px] tracking-wider uppercase">
+                    AI CHATBOT
+                  </div>
+                  <div className="text-stone-300 text-xs font-semibold">
+                    Trợ lý gỡ lỗi chuyên sâu Sandbox
+                  </div>
+                  <button 
+                    onClick={() => {
+                      setAiChat([]);
+                      askAiAssistant("Chào bạn, tôi vừa làm sạch bộ nhớ. Hãy phân tích lại toàn diện mã nguồn này và các log/lỗi hiện hữu nhé.", true);
+                    }}
+                    className="ml-auto text-[10px] text-stone-400 hover:text-white bg-stone-800 hover:bg-stone-750 p-1 px-2 rounded transition-colors font-mono flex items-center gap-1"
+                  >
+                    🔄 Khởi động lại AI
+                  </button>
+                </div>
+
+                {/* Logs Summary Banner inside AI panel */}
+                {logs.length > 0 && (
+                  <div className="mb-3 bg-red-950/40 p-2.5 px-3 rounded-lg border border-red-900/30 text-xs flex items-center gap-2">
+                    <span className="flex-shrink-0 inline-block w-2 h-2 rounded-full bg-red-500 animate-ping"></span>
+                    <span className="text-red-300 font-medium">Tìm thấy {logs.filter(l => l.type === 'error').length} lỗi runtime trong Console logs.</span>
+                    <button 
+                      onClick={() => askAiAssistant("Tôi vừa gặp lỗi ở runtime. Hãy phân tích các Console logs bị lỗi này và giải thích chi tiết nguyên nhân kèm cách sửa cụ thể nhé.")}
+                      className="ml-auto bg-red-800 hover:bg-red-700 text-white font-bold text-[10px] px-2 py-1 rounded transition-colors"
+                      disabled={isAiLoading}
+                    >
+                      💡 Phân tích lỗi ngay
+                    </button>
+                  </div>
+                )}
+
+                {/* Conversation History */}
+                <div className="flex-1 overflow-y-auto mb-4 flex flex-col gap-3 min-h-[250px] max-h-[380px] p-3 bg-stone-950/80 rounded-lg border border-stone-850 scrollbar-thin">
+                  {aiChat.map((msg, index) => (
+                    <div 
+                      key={index} 
+                      className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}
+                    >
+                      <div className="text-[10px] text-stone-500 mb-1 font-mono uppercase tracking-widest px-1">
+                        {msg.role === 'user' ? 'MÃ NGUỒN' : 'Trợ lý AI'}
+                      </div>
+                      <div 
+                        className={`rounded-lg p-3 text-xs leading-relaxed max-w-[90%] whitespace-pre-wrap ${
+                          msg.role === 'user' 
+                            ? 'bg-stone-800 text-stone-100 border border-stone-700/50' 
+                            : 'bg-stone-900/60 text-stone-200 border border-stone-850 font-sans'
+                        }`}
+                      >
+                        {msg.role === 'model' ? (
+                          <div className="flex flex-col">
+                            <div className="prose prose-sm prose-invert max-w-none text-stone-200 break-words font-sans space-y-1">
+                              <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>
+                                {msg.text}
+                              </ReactMarkdown>
+                            </div>
+                            {(() => {
+                              const blocks = extractHtmlCodeBlocks(msg.text);
+                              if (blocks.length === 0) return null;
+                              return (
+                                <div className="mt-3 pt-3 border-t border-stone-800/80 flex flex-col gap-2">
+                                  <div className="text-[10px] text-emerald-400 font-semibold uppercase tracking-wider font-mono flex items-center gap-1">
+                                    <span>🎯</span> Phát hiện mã đã sửa từ AI ({blocks.length} khối):
+                                  </div>
+                                  <div className="flex flex-col gap-2">
+                                    {blocks.map((block, idx) => (
+                                      <div key={idx} className="flex flex-wrap gap-1.5 pt-0.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setEditedCode(block);
+                                            setShowSource(false);
+                                          }}
+                                          className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-[10px] uppercase tracking-wider px-2.5 py-1.5 rounded transition-all flex items-center gap-1.5 shadow-sm hover:scale-[1.02] active:scale-[0.98]"
+                                        >
+                                          🚀 Áp dụng & Chạy Sandbox {blocks.length > 1 ? `#${idx + 1}` : ''}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setEditedCode(block);
+                                            setSourceTab('raw');
+                                          }}
+                                          className="bg-stone-800 hover:bg-stone-750 text-stone-300 border border-stone-700 text-[10px] uppercase tracking-wider px-2 py-1.5 rounded transition-all flex items-center gap-1"
+                                        >
+                                          🔍 Áp dụng & Xem mã
+                                        </button>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              );
+                            })()}
+                          </div>
+                        ) : (
+                          msg.text
+                        )}
+                      </div>
+                    </div>
+                  ))}
+
+                  {isAiLoading && (
+                    <div className="flex flex-col items-start">
+                      <div className="text-[10px] text-stone-500 mb-1 font-mono uppercase tracking-widest px-1">
+                        Trợ lý AI
+                      </div>
+                      <div className="bg-stone-900/60 text-stone-400 border border-stone-850 rounded-lg p-3 text-xs flex items-center gap-2">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+                        <span className="font-mono text-[11px]">Trợ lý đang xem mã nguồn và gỡ lỗi...</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {aiError && (
+                    <div className="bg-red-950/50 text-red-300 border border-red-900/40 rounded-lg p-3 text-xs">
+                      ⚠️ {aiError}
+                    </div>
+                  )}
+                </div>
+
+                {/* Quick actions suggest panel */}
+                <div className="mb-3 flex flex-wrap gap-1.5">
+                  <button 
+                    onClick={() => askAiAssistant("Giải thích ngắn gọn cấu trúc và luồng chạy của file widget này.")}
+                    className="text-[10px] bg-stone-900 hover:bg-stone-800 text-stone-300 border border-stone-800 px-2.5 py-1 rounded transition-colors"
+                    disabled={isAiLoading}
+                  >
+                    📋 Giải thích code
+                  </button>
+                  <button 
+                    onClick={() => askAiAssistant("Kiểm tra xem mã nguồn này có bất kỳ lỗi cú pháp, vấn đề đồng bộ, hoặc cấu trúc nào có thể tối ưu không.")}
+                    className="text-[10px] bg-stone-900 hover:bg-stone-800 text-stone-300 border border-stone-800 px-2.5 py-1 rounded transition-colors"
+                    disabled={isAiLoading}
+                  >
+                    🛡️ Tối ưu hóa & Check lỗi
+                  </button>
+                  <button 
+                    onClick={() => askAiAssistant("Tìm và giải thích tất cả các đoạn xử lý nút bấm (onclick/event handlers) trong widget này.")}
+                    className="text-[10px] bg-stone-900 hover:bg-stone-800 text-stone-300 border border-stone-800 px-2.5 py-1 rounded transition-colors"
+                    disabled={isAiLoading}
+                  >
+                    🖱️ Xem bộ xử lý sự kiện (Events)
+                  </button>
+                </div>
+
+                {/* Input block */}
+                <form 
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    askAiAssistant();
+                  }}
+                  className="flex gap-2"
+                >
+                  <input 
+                    type="text"
+                    value={aiInput}
+                    onChange={(e) => setAiInput(e.target.value)}
+                    placeholder="Nhập câu hỏi hoặc mô tả lỗi bạn đang gặp phải..."
+                    className="flex-1 bg-stone-900 border border-stone-800 rounded px-3 py-1.5 text-xs text-stone-100 placeholder-stone-500 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/30"
+                    disabled={isAiLoading}
+                  />
+                  <button 
+                    type="submit"
+                    className="bg-emerald-600 hover:bg-emerald-500 disabled:bg-stone-800 disabled:text-stone-500 text-white font-bold text-xs px-4 py-1.5 rounded transition-all flex items-center gap-1.5"
+                    disabled={isAiLoading || !aiInput.trim()}
+                  >
+                    <span>Gửi</span>
+                    <span>✈️</span>
+                  </button>
+                </form>
+              </div>
+            ) : sourceTab === 'raw' && isEditingManually ? (
+              <div className="w-full flex flex-col gap-2.5">
+                <textarea
+                  value={decoded}
+                  onChange={(e) => setEditedCode(e.target.value)}
+                  className="w-full min-h-[350px] bg-stone-900 text-stone-100 font-mono text-xs p-3 rounded border border-stone-850 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500/35 leading-relaxed scrollbar-thin resize-y"
+                  placeholder="Nhập mã nguồn HTML/JS của bạn ở đây để cập nhật Sandbox trực tiếp..."
+                />
+                <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between text-[11px] text-stone-400 font-mono gap-2 bg-stone-900/50 p-2.5 rounded border border-stone-850">
+                  <span>💡 Mã nguồn tự động áp dụng vào Sandbox ngay khi nhập. Bạn có thể đóng mã nguồn để xem kết quả.</span>
+                  <button
+                    type="button"
+                    onClick={() => setIsEditingManually(false)}
+                    className="bg-indigo-600 hover:bg-indigo-500 text-white font-bold font-sans uppercase tracking-wide px-3 py-1 rounded transition-colors self-end sm:self-auto cursor-pointer"
+                  >
+                    Hoàn tất & Chạy thử 🚀
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="min-w-full table border-collapse">
+                {(sourceTab === 'compiled' ? fullDoc : decoded).split('\n').map((lineText, idx) => {
+                  const lineNum = idx + 1;
+                  const isError = sourceTab === 'compiled' && highlightedLine === lineNum;
+                  return (
+                    <div 
+                      key={lineNum} 
+                      id={`compiled-line-${lineNum}`}
+                      className={`table-row group hover:bg-stone-900/50 ${isError ? 'bg-red-950/70 text-red-200 font-semibold' : ''}`}
+                      style={isError ? { borderLeft: '4px solid #ef4444' } : undefined}
+                    >
+                      <span className={`table-cell select-none text-right pr-4 text-[10px] opacity-40 group-hover:opacity-75 w-12 border-r border-stone-850 ${isError ? 'text-red-400 font-bold opacity-100' : 'text-stone-500'}`}>
+                        {lineNum}
+                      </span>
+                      <span className="table-cell pl-4 whitespace-pre break-all">
+                        {lineText || ' '}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
         </div>
       ) : (
         <div 
@@ -732,7 +1313,7 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
             ref={iframeRef}
             title="Iframe Sandbox"
             srcDoc={fullDoc}
-            sandbox="allow-scripts allow-forms allow-popups allow-modals" // Đã LOẠI BỎ allow-same-origin theo phương pháp Căn phòng kính biệt giam
+            sandbox="allow-scripts allow-forms allow-popups allow-modals allow-same-origin"
             className="w-full h-full bg-transparent block"
             style={{
               border: 'none'
@@ -752,9 +1333,30 @@ const IframeSandboxWidget = ({ contentAttr }: { contentAttr: string }) => {
                <div className="text-stone-500 italic px-1">No logs to display...</div>
             ) : (
                logs.map((log, i) => (
-                 <div key={i} className={`px-2 py-1 rounded border-l-2 ${log.type === 'error' ? 'bg-red-900/20 text-red-400 border-red-500' : log.type === 'warn' ? 'bg-yellow-900/20 text-yellow-400 border-yellow-500' : 'text-stone-300 border-transparent hover:bg-white/5'}`}>
+                 <div 
+                   key={i} 
+                   onClick={() => {
+                     if (log.lineno) {
+                       setHighlightedLine(log.lineno);
+                       setSourceTab('compiled');
+                       setShowSource(true);
+                       setTimeout(() => {
+                         const el = document.getElementById(`compiled-line-${log.lineno}`);
+                         if (el) {
+                           el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                         }
+                       }, 100);
+                     }
+                   }}
+                   className={`px-2 py-1 rounded border-l-2 ${log.lineno ? 'cursor-pointer hover:bg-red-950/20' : ''} ${log.type === 'error' ? 'bg-red-900/20 text-red-400 border-red-500' : log.type === 'warn' ? 'bg-yellow-900/20 text-yellow-400 border-yellow-500' : 'text-stone-300 border-transparent hover:bg-white/5'}`}
+                 >
                    <span className="opacity-50 mr-2 text-[9px]">{log.time}</span>
                    {log.message}
+                   {log.lineno ? (
+                     <span className="underline ml-2 text-[9px] text-red-300 font-sans hover:text-red-100 font-semibold">
+                       (Nhấp để bôi đỏ dòng {log.lineno})
+                     </span>
+                   ) : null}
                  </div>
                ))
             )}

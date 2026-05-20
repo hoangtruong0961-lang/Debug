@@ -20,6 +20,7 @@ const SettingsScreen: React.FC<SettingsScreenProps> = ({ onNavigate, fromGame })
   const [activeTab, setActiveTab] = useState<'general' | 'display' | 'game' | 'advanced' | 'api'>('general');
   const { setTheme, setFontFamily, setFontSize, setVisualEffects } = useTheme();
   const [localFontSize, setLocalFontSize] = useState<string>('');
+  const [manualKeyText, setManualKeyText] = useState('');
 
   const [bgImage, setBgImage] = useState<string | null>("https://i.ibb.co/GfrntJtx/d8103ce8dea71d9a891e08e3ff0534c1.webp");
   const bgBlur = localStorage.getItem('ark_v2_bg_blur') !== 'false';
@@ -107,6 +108,17 @@ const SettingsScreen: React.FC<SettingsScreenProps> = ({ onNavigate, fromGame })
   const handleResetFactory = async () => {
       setSettings(DEFAULT_SETTINGS);
       await dbService.saveSettings(DEFAULT_SETTINGS);
+  };
+
+  const handleAddManualKeys = () => {
+    const newKeys = manualKeyText.split('\n').map(k => k.trim()).filter(k => k !== '');
+    if (newKeys.length > 0) {
+      const currentKeys = settings?.geminiApiKey || [];
+      const updatedKeys = [...currentKeys];
+      newKeys.forEach(nk => { if (!updatedKeys.includes(nk)) updatedKeys.push(nk); });
+      handleChange('geminiApiKey', updatedKeys);
+      setManualKeyText('');
+    }
   };
 
   const handleLoadModels = async () => {
@@ -1163,21 +1175,25 @@ const SettingsScreen: React.FC<SettingsScreenProps> = ({ onNavigate, fromGame })
                         </div>
 
                         <div className="space-y-3">
-                          <label className="block text-sm font-bold text-slate-300">Thêm API Key Thủ Công</label>
+                          <div className="flex items-center justify-between">
+                            <label className="block text-sm font-bold text-slate-300">Thêm API Key Thủ Công</label>
+                            <button 
+                                onClick={handleAddManualKeys}
+                                className="text-xs bg-mystic-accent hover:bg-mystic-accent/85 text-white border border-mystic-accent/30 px-3 py-1.5 rounded-lg transition-all font-bold flex items-center gap-1 shadow-[0_0_10px_rgba(56,189,248,0.2)] disabled:opacity-40 disabled:cursor-not-allowed cursor-pointer"
+                                disabled={!manualKeyText.trim()}
+                            >
+                                <Plus size={14} /> Thêm Key
+                            </button>
+                          </div>
                           <textarea 
-                              placeholder="AIzaSy... (Mỗi dòng 1 key, nhấn Ctrl+Enter để thêm)"
+                              placeholder="AIzaSy... (Mỗi dòng 1 key, nhập xong nhấn nút Thêm Key hoặc nhấn Ctrl+Enter)"
                               className="w-full bg-slate-900/80 border border-slate-700 rounded-xl p-4 text-sm text-slate-300 focus:border-mystic-accent outline-none font-mono min-h-[100px]"
+                              value={manualKeyText}
+                              onChange={(e) => setManualKeyText(e.target.value)}
                               onKeyDown={(e) => {
                                   if (e.key === 'Enter' && e.ctrlKey) {
-                                      const target = e.target as HTMLTextAreaElement;
-                                      const newKeys = target.value.split('\n').map(k => k.trim()).filter(k => k !== '');
-                                      if (newKeys.length > 0) {
-                                          const currentKeys = settings.geminiApiKey || [];
-                                          const updatedKeys = [...currentKeys];
-                                          newKeys.forEach(nk => { if (!updatedKeys.includes(nk)) updatedKeys.push(nk); });
-                                          handleChange('geminiApiKey', updatedKeys);
-                                          target.value = '';
-                                      }
+                                      e.preventDefault();
+                                      handleAddManualKeys();
                                   }
                               }}
                           />

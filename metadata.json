@@ -2,5 +2,7 @@
   "name": "Remix: ARK v6.0.0.0",
   "description": "",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
