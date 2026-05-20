@@ -37,7 +37,7 @@ const WorldCreationScreen: React.FC<WorldCreationProps> = ({ onNavigate, onGameS
     player: store.player,
     world: store.world,
     config: store.config,
-    entities: store.entities,
+    entities: Array.isArray(store.entities) ? store.entities : [],
     gameTime: store.gameTime,
     lorebook: store.lorebook,
     isGenerating: store.isGenerating,

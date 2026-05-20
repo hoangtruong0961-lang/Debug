@@ -86,9 +86,18 @@ export const useWorldCreationStore = create<WorldCreationState>((set) => ({
   updateCustomWords: (min, max) => set((state) => ({ config: { ...state.config, customMinWords: min, customMaxWords: max } })),
   addRule: (rule) => set((state) => ({ config: { ...state.config, rules: [...state.config.rules, rule] } })),
   removeRule: (index) => set((state) => ({ config: { ...state.config, rules: state.config.rules.filter((_, i) => i !== index) } })),
-  addEntity: (entity) => set((state) => ({ entities: [...state.entities, { ...entity, id: simpleId() }] as Entity[] })),
-  updateEntity: (id, entityUpdate) => set((state) => ({ entities: state.entities.map(e => e.id === id ? { ...e, ...entityUpdate } : e) as Entity[] })),
-  removeEntity: (id) => set((state) => ({ entities: state.entities.filter(e => e.id !== id) })),
+  addEntity: (entity) => set((state) => {
+    const current = Array.isArray(state.entities) ? state.entities : [];
+    return { entities: [...current, { ...entity, id: simpleId() }] as Entity[] };
+  }),
+  updateEntity: (id, entityUpdate) => set((state) => {
+    const current = Array.isArray(state.entities) ? state.entities : [];
+    return { entities: current.map(e => e.id === id ? { ...e, ...entityUpdate } : e) as Entity[] };
+  }),
+  removeEntity: (id) => set((state) => {
+    const current = Array.isArray(state.entities) ? state.entities : [];
+    return { entities: current.filter(e => e.id !== id) };
+  }),
   updateGameTime: (field, value) => set((state) => ({ gameTime: { ...state.gameTime, [field]: value } })),
   setGenerating: (isGenerating, field) => set({ isGenerating, generatingField: field || null }),
   
@@ -105,20 +114,23 @@ export const useWorldCreationStore = create<WorldCreationState>((set) => ({
       return result;
     };
 
+    const currentEntities = Array.isArray(state.entities) ? state.entities : [];
+    const incomingEntities = Array.isArray(payload.entities) ? payload.entities : [];
+
     return {
       player: mergeIfEmpty(state.player, payload.player),
       world: mergeIfEmpty(state.world, payload.world),
-      entities: (payload.entities && payload.entities.length >= state.entities.length) ? payload.entities : state.entities,
+      entities: (incomingEntities.length >= currentEntities.length) ? incomingEntities : currentEntities,
       gameTime: (payload.gameTime && state.gameTime.year === 2024) ? payload.gameTime : state.gameTime,
       config: { ...state.config, rules: payload.config?.rules || state.config.rules }
     };
   }),
   
   importData: (payload) => set((state) => ({
-    player: payload.player,
-    world: payload.world,
-    config: payload.config,
-    entities: payload.entities,
+    player: payload.player || state.player,
+    world: payload.world || state.world,
+    config: payload.config || state.config,
+    entities: Array.isArray(payload.entities) ? payload.entities : [],
     gameTime: payload.gameTime || state.gameTime,
     lorebook: payload.lorebook || state.lorebook,
     isGenerating: false,
@@ -126,6 +138,6 @@ export const useWorldCreationStore = create<WorldCreationState>((set) => ({
   })),
 
   updateLorebook: (payload) => set({ lorebook: payload }),
-  setEntities: (entities) => set({ entities }),
+  setEntities: (entities) => set({ entities: Array.isArray(entities) ? entities : [] }),
   reset: () => set(initialState)
 }));
